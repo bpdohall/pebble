@@ -104,7 +104,7 @@ const (
 
 	// The default value when PEBBLE_WFE_AUTHZREUSE is not set, how often to try
 	// and reuse valid authorizations.
-	defaultAuthzReuse = 50
+	defaultAuthzReuse = 100
 
 	// ordersPerPageEnvVar defines the environment variable name used to provide
 	// the number of orders to show per page. To have the WFE show 15 orders per
@@ -153,10 +153,13 @@ func (th *topHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	th.wfe.ServeHTTP(w, r)
 }
 
+type authzHistory map[string]int
+
 type WebFrontEndImpl struct {
 	log               *log.Logger
 	db                *db.MemoryStore
 	nonce             *nonceMap
+	authzHistory	  authzHistory
 	nonceErrPercent   int
 	authzReusePercent int
 	ordersPerPage     int
@@ -231,6 +234,7 @@ func New(
 		nonce:             newNonceMap(),
 		nonceErrPercent:   nonceErrPercent,
 		authzReusePercent: authzReusePercent,
+		authzHistory: 	   make(authzHistory),
 		ordersPerPage:     ordersPerPage,
 		va:                va,
 		ca:                ca,
@@ -1601,7 +1605,7 @@ func (wfe *WebFrontEndImpl) makeChallenges(authz *core.Authorization, request *h
 			enabledChallenges = []string{acme.ChallengeHTTP01, acme.ChallengeTLSALPN01}
 		} else {
 			// Non-wildcard, non-IP identifier authorizations get all of the enabled challenge types
-			enabledChallenges = []string{acme.ChallengeHTTP01, acme.ChallengeTLSALPN01, acme.ChallengeDNS01}
+			enabledChallenges = []string{acme.ChallengeDNS01}
 		}
 		for _, chalType := range enabledChallenges {
 			chal, err := wfe.makeChallenge(chalType, authz, request)
@@ -1683,6 +1687,10 @@ func (wfe *WebFrontEndImpl) NewOrder(
 			NotAfter:    newOrder.NotAfter,
 		},
 		ExpiresDate: expires,
+	}
+
+	if existingOrder := wfe.db.FindExistingOrder(existingReg.ID, uniquenames); existingOrder != nil {
+		order = existingOrder
 	}
 
 	// Verify the details of the order before creating authorizations
@@ -2056,6 +2064,19 @@ func (wfe *WebFrontEndImpl) Authz(
 	if authz == nil {
 		response.WriteHeader(http.StatusNotFound)
 		return
+	}
+
+	wfe.authzHistory[authzID]++
+	if wfe.authzHistory[authzID] < 3 {
+		wfe.log.Printf("-- Simulating authz failure for %s", authzID)
+		wfe.sendError(&acme.ProblemDetails{
+				Type:   "urn:ietf:params:acme:error:notfound",
+				Detail: "Authorization not found.",
+				HTTPStatus: http.StatusNotFound,
+			}, response)
+		return
+	} else {
+		wfe.log.Printf("-- Allowing authz to proceed, simulated failures exhausted for %s", authzID)
 	}
 
 	authz.Lock()
@@ -2508,10 +2529,7 @@ func addRetryAfterHeader(response http.ResponseWriter, second int) {
 		if rand.Intn(2) == 0 {
 			response.Header().Add("Retry-After", strconv.Itoa(second))
 		} else {
-			// IMF-fixdate
-			// see https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.1.1
-			gmt, _ := time.LoadLocation("GMT")
-			currentTime := time.Now().In(gmt)
+			currentTime := time.Now().UTC()
 			retryAfter := currentTime.Add(time.Second * time.Duration(second))
 			response.Header().Add("Retry-After", retryAfter.Format(http.TimeFormat))
 		}

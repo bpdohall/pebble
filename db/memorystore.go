@@ -180,15 +180,16 @@ func (m *MemoryStore) AddOrder(order *core.Order) (int, error) {
 		return 0, fmt.Errorf("order must have a non-empty ID to add to MemoryStore")
 	}
 
-	if _, present := m.ordersByID[orderID]; present {
-		return 0, fmt.Errorf("order %q already exists", orderID)
-	}
-
 	var ordersByAccountID []*core.Order
 	var present bool
 	if ordersByAccountID, present = m.ordersByAccountID[accountID]; !present {
 		ordersByAccountID = make([]*core.Order, 0)
 	}
+
+	if _, ok := m.ordersByID[orderID]; ok {
+		return len(m.ordersByID), nil
+	}
+
 	m.ordersByAccountID[accountID] = append(ordersByAccountID, order)
 
 	m.ordersByID[orderID] = order
@@ -231,6 +232,43 @@ func (m *MemoryStore) GetOrdersByAccountID(accountID string) []*core.Order {
 	return nil
 }
 
+func compareIdentifiers(a, b []acme.Identifier) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		for j := range b {
+			if a[i].Type == b[j].Type && a[i].Value == b[j].Value {
+				break
+			}
+			if j == len(b)-1 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (m *MemoryStore) FindExistingOrder(accountID string, identifiers []acme.Identifier) *core.Order {
+	orders := m.GetOrdersByAccountID(accountID)
+	if orders == nil {
+		return nil
+	}
+	fmt.Printf("searching %d existing orders for: %v\n", len(orders), identifiers)
+
+	for _, order := range orders {
+		if order.Status == acme.StatusPending || order.Status == acme.StatusReady {
+			if compareIdentifiers(order.Identifiers, identifiers) {
+				return order
+			}
+		} else {
+			fmt.Printf("skipping order %q with status %q\n", order.ID, order.Status)
+		}
+	}
+	fmt.Printf("didn't find any existing orders for: %v\n", identifiers)
+	return nil
+}
+
 func (m *MemoryStore) AddAuthorization(authz *core.Authorization) (int, error) {
 	m.Lock()
 	defer m.Unlock()
@@ -266,7 +304,7 @@ func (m *MemoryStore) FindValidAuthorization(accountID string, identifier acme.I
 		// Racey code path is exercised through the test in va/va_test.go, which should be considered
 		// for removal in the event that there's a by-value refactoring of MemoryStore.
 		authz.RLock()
-		if authz.Status == acme.StatusValid && identifier.Equals(authz.Identifier) &&
+		if (authz.Status == acme.StatusValid || authz.Status == acme.StatusPending) && identifier.Equals(authz.Identifier) &&
 			authz.Order != nil && authz.Order.AccountID == accountID &&
 			authz.ExpiresDate.After(time.Now()) {
 			authz.RUnlock()
